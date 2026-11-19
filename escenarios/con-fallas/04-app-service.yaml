@@ -1,0 +1,48 @@
+# ==============================================================================
+# ESCENARIO CON FALLAS - 04-app-service.yaml
+# FALLA INYECTADA: Falla B (Red / Puerto de Destino Incorrecto)
+# DESCRIPCIÓN: El servicio mongo-service redirige tráfico al targetPort 27018
+#              en lugar del 27017 donde escucha mongod.
+# EFECTO: La app no puede conectar con MongoDB (Connection Refused / Timeout),
+#         la sonda /health/ready devuelve HTTP 503 y la BD aparece DESCONECTADA.
+# ==============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongo-service
+  namespace: practica-s12
+  labels:
+    app: mongo
+    app.kubernetes.io/name: mongo-service
+    app.kubernetes.io/part-of: practica-s12
+    escenario: con-fallas
+spec:
+  type: ClusterIP
+  selector:
+    app: mongo
+  ports:
+    - name: mongodb
+      port: 27017
+      # [FALLA B] Puerto incorrecto: 27018 en lugar de 27017
+      targetPort: 27018
+      protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: app-service
+  namespace: practica-s12
+  labels:
+    app: app
+    app.kubernetes.io/name: app-service
+    app.kubernetes.io/part-of: practica-s12
+spec:
+  type: NodePort
+  selector:
+    app: app
+  ports:
+    - name: http
+      port: 3000
+      targetPort: 3000
+      nodePort: 30080
+      protocol: TCP

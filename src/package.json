@@ -1,0 +1,16 @@
+{
+  "name": "avsa-k8s-app",
+  "version": "1.0.0",
+  "description": "Aplicación Node.js + Express + MongoDB para despliegue cloud, seguridad y troubleshooting en K3s sobre AWS EC2 - Proyecto AVSA",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "mongodb": "^6.5.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

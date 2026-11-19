@@ -1,0 +1,830 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Plantilla CloudFormation para el despliegue del proyecto AVSA:
+  Infraestructura VPC, Subnet Publica, Security Group y EC2 con Ubuntu 24.04 LTS
+  ejecutando Docker, Kubernetes (K3s) y el escenario de troubleshooting con fallas.
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: t3.medium
+    AllowedValues:
+      - t3.small
+      - t3.medium
+      - t3.large
+      - t2.medium
+    Description: Tipo de instancia EC2 recomendada para K3s y MongoDB.
+
+  LatestUbuntu2404AmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id'
+    Description: Parámetro SSM dinámico para obtener la AMI oficial más reciente de Ubuntu 24.04 LTS por región.
+
+  KeyName:
+    Type: String
+    Default: ""
+    Description: (Opcional) Nombre del KeyPair existente en AWS para acceso SSH.
+
+  SSHLocation:
+    Type: String
+    Default: "0.0.0.0/0"
+    Description: Rango CIDR IP autorizado para acceso administrativo SSH.
+
+Conditions:
+  HasKeyName: !Not [!Equals [!Ref KeyName, ""]]
+
+Resources:
+  # ============================================================================
+  # 1. RED VIRTUAL (VPC & NETWORKING)
+  # ============================================================================
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: vpc-avsa-k3s
+        - Key: Project
+          Value: AVSA-S12
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: igw-avsa-k3s
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: subnet-avsa-public
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: rtb-avsa-public
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  # ============================================================================
+  # 2. GRUPO DE SEGURIDAD (SECURITY GROUP)
+  # ============================================================================
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security Group para nodo K3s AVSA (SSH: 22, NodePort: 30080)
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        # Puerto 22: Acceso SSH
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SSHLocation
+          Description: "Acceso SSH administrativo"
+        # Puerto 30080: NodePort para la aplicacion AVSA
+        - IpProtocol: tcp
+          FromPort: 30080
+          ToPort: 30080
+          CidrIp: 0.0.0.0/0
+          Description: "Acceso HTTP a la aplicacion Node.js (NodePort K3s)"
+        # Puerto 6443: API de Kubernetes K3s (acceso local o administracion)
+        - IpProtocol: tcp
+          FromPort: 6443
+          ToPort: 6443
+          CidrIp: !Ref SSHLocation
+          Description: "Acceso a la API Server de K3s"
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: "Salida total a Internet"
+      Tags:
+        - Key: Name
+          Value: sg-avsa-k3s
+
+  # ============================================================================
+  # 3. INSTANCIA EC2 UBUNTU 24.04 CON K3S Y APLICACIÓN AVSA
+  # ============================================================================
+  K3sEC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref LatestUbuntu2404AmiId
+      KeyName: !If [HasKeyName, !Ref KeyName, !Ref "AWS::NoValue"]
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref InstanceSecurityGroup
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 30
+            VolumeType: gp3
+            DeleteOnTermination: true
+      Tags:
+        - Key: Name
+          Value: ec2-avsa-k3s-master
+        - Key: Project
+          Value: AVSA-S12
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -e
+          exec > >(tee -a /var/log/s12.log) 2>&1
+          echo "========================================================="
+          echo "[S12] INICIANDO PROVISIÓN DE NODO K3S PARA AVSA"
+          echo "Fecha: $(date -u)"
+          echo "========================================================="
+
+          export DEBIAN_FRONTEND=noninteractive
+
+          # 1. Actualización e instalación de paquetes base y Docker
+          echo "[S12] Instalando Docker y herramientas auxiliares..."
+          apt-get update -y
+          apt-get install -y ca-certificates curl gnupg lsb-release jq git docker.io
+
+          systemctl enable --now docker
+          usermod -aG docker ubuntu
+
+          # 2. Instalación de K3s (Kubernetes ligero)
+          echo "[S12] Instalando K3s con permisos 644 en kubeconfig..."
+          curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--write-kubeconfig-mode 644" sh -
+
+          # Configurar acceso a kubectl para usuario ubuntu y root
+          export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+          mkdir -p /home/ubuntu/.kube
+          cp /etc/rancher/k3s/k3s.yaml /home/ubuntu/.kube/config
+          chown -R ubuntu:ubuntu /home/ubuntu/.kube
+          chmod 600 /home/ubuntu/.kube/config
+          echo "export KUBECONFIG=/etc/rancher/k3s/k3s.yaml" >> /home/ubuntu/.bashrc
+
+          echo "[S12] Esperando que K3s API esté lista..."
+          until kubectl get nodes --request-timeout='5s' >/dev/null 2>&1; do
+            echo "[S12] Esperando nodo de K3s..."
+            sleep 3
+          done
+          kubectl wait --for=condition=Ready node --all --timeout=120s
+
+          # 3. Creación de la estructura del proyecto en /home/ubuntu/s12
+          echo "[S12] Creando estructura del proyecto en /home/ubuntu/s12..."
+          mkdir -p /home/ubuntu/s12/src
+          mkdir -p /home/ubuntu/s12/k8s
+          mkdir -p /home/ubuntu/s12/escenarios/con-fallas
+          mkdir -p /home/ubuntu/s12/docs
+
+          # 3.1 src/package.json
+          cat <<'EOF' > /home/ubuntu/s12/src/package.json
+          {
+            "name": "avsa-k8s-app",
+            "version": "1.0.0",
+            "description": "Aplicación Node.js + Express + MongoDB para despliegue en K3s / AWS EC2",
+            "main": "server.js",
+            "scripts": {
+              "start": "node server.js"
+            },
+            "dependencies": {
+              "express": "^4.19.2",
+              "mongodb": "^6.5.0"
+            }
+          }
+          EOF
+
+          # 3.2 src/server.js
+          cat <<'EOF' > /home/ubuntu/s12/src/server.js
+          const express = require('express');
+          const { MongoClient } = require('mongodb');
+          const os = require('os');
+
+          const APP_PORT = parseInt(process.env.APP_PORT || '3000', 10);
+          const DB_HOST = process.env.DB_HOST || 'mongo-service';
+          const DB_PORT = process.env.DB_PORT || '27017';
+          const DB_NAME = process.env.DB_NAME;
+          const DB_USER = process.env.DB_USER || '';
+          const DB_PASS = process.env.DB_PASS || '';
+
+          console.log('[AVSA] Iniciando aplicación...');
+          console.log(`- DB_NAME: ${DB_NAME || '<NO DEFINIDO>'}`);
+
+          if (!DB_NAME || DB_NAME.trim() === '') {
+            console.error('[ERROR FATAL] Variable de entorno requerida "DB_NAME" no está definida.');
+            process.exit(1);
+          }
+
+          let mongoUri = '';
+          if (DB_USER && DB_PASS) {
+            mongoUri = `mongodb://${encodeURIComponent(DB_USER)}:${encodeURIComponent(DB_PASS)}@${DB_HOST}:${DB_PORT}/${DB_NAME}?authSource=admin`;
+          } else {
+            mongoUri = `mongodb://${DB_HOST}:${DB_PORT}/${DB_NAME}`;
+          }
+
+          const client = new MongoClient(mongoUri, { serverSelectionTimeoutMS: 2000 });
+          let db = null;
+          let isMongoConnected = false;
+
+          async function connectToMongo() {
+            try {
+              if (!isMongoConnected) {
+                await client.connect();
+                db = client.db(DB_NAME);
+                isMongoConnected = true;
+                console.log(`[AVSA] Conectado a MongoDB: ${DB_HOST}:${DB_PORT}/${DB_NAME}`);
+              }
+            } catch (err) {
+              isMongoConnected = false;
+              db = null;
+              console.warn(`[AVSA] Fallo conexión MongoDB: ${err.message}`);
+            }
+          }
+
+          connectToMongo();
+          setInterval(connectToMongo, 5000);
+
+          const app = express();
+          app.use(express.json());
+
+          app.get('/', async (req, res) => {
+            let visitas = 0;
+            if (isMongoConnected && db) {
+              try {
+                const col = db.collection('visitas');
+                const result = await col.findOneAndUpdate(
+                  { _id: 'contador_global' },
+                  { $inc: { total: 1 } },
+                  { upsert: true, returnDocument: 'after' }
+                );
+                visitas = result ? result.total : 1;
+              } catch (e) {
+                visitas = 'Error registrando visita';
+              }
+            } else {
+              visitas = 'No disponible (MongoDB desconectado)';
+            }
+
+            const uid = typeof process.getuid === 'function' ? process.getuid() : null;
+            const gid = typeof process.getgid === 'function' ? process.getgid() : null;
+            let username = 'appuser';
+            try { username = os.userInfo().username; } catch (e) { username = `uid-${uid}`; }
+
+            res.json({
+              aplicacion: "AVSA - Practica S12 (Kubernetes en AWS)",
+              pod: process.env.HOSTNAME || "desconocido",
+              usuario: {
+                uid: uid,
+                gid: gid,
+                nombre: username,
+                root: uid === 0
+              },
+              mongodb: isMongoConnected ? "CONECTADO" : "DESCONECTADO",
+              baseDeDatos: DB_NAME,
+              visitas: visitas
+            });
+          });
+
+          app.get('/health/live', (req, res) => {
+            res.status(200).json({ status: 'ALIVE', uptime: process.uptime() });
+          });
+
+          app.get('/health/ready', async (req, res) => {
+            if (isMongoConnected && db) {
+              try {
+                await db.command({ ping: 1 });
+                return res.status(200).json({ status: 'READY', mongodb: 'CONECTADO' });
+              } catch (e) {
+                return res.status(503).json({ status: 'NOT_READY', mongodb: 'DESCONECTADO', error: e.message });
+              }
+            }
+            res.status(503).json({ status: 'NOT_READY', mongodb: 'DESCONECTADO' });
+          });
+
+          app.get('/api/productos', async (req, res) => {
+            if (!isMongoConnected || !db) return res.status(503).json({ error: 'MongoDB desconectado' });
+            try {
+              const productos = await db.collection('productos').find({}).toArray();
+              res.json({ total: productos.length, productos });
+            } catch (e) {
+              res.status(500).json({ error: e.message });
+            }
+          });
+
+          app.post('/api/productos', async (req, res) => {
+            if (!isMongoConnected || !db) return res.status(503).json({ error: 'MongoDB desconectado' });
+            try {
+              const item = { ...req.body, fecha: new Date() };
+              const r = await db.collection('productos').insertOne(item);
+              res.status(201).json({ mensaje: 'Producto creado', id: r.insertedId, producto: item });
+            } catch (e) {
+              res.status(500).json({ error: e.message });
+            }
+          });
+
+          app.listen(APP_PORT, '0.0.0.0', () => {
+            console.log(`[AVSA] Servidor escuchando en puerto ${APP_PORT}`);
+          });
+          EOF
+
+          # 3.3 src/Dockerfile
+          cat <<'EOF' > /home/ubuntu/s12/src/Dockerfile
+          FROM node:20-alpine
+          RUN addgroup -g 10001 -S appgroup && adduser -u 10001 -S appuser -G appgroup
+          WORKDIR /app
+          COPY package.json ./
+          RUN npm install --omit=dev --no-audit --no-fund
+          COPY server.js ./
+          RUN chown -R appuser:appgroup /app && mkdir -p /home/appuser /tmp && chown -R appuser:appgroup /home/appuser /tmp
+          USER 10001:10001
+          EXPOSE 3000
+          CMD ["node", "server.js"]
+          EOF
+
+          # 3.4 k8s/00-namespace.yaml
+          cat <<'EOF' > /home/ubuntu/s12/k8s/00-namespace.yaml
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: practica-s12
+            labels:
+              pod-security.kubernetes.io/enforce: restricted
+              pod-security.kubernetes.io/enforce-version: latest
+              pod-security.kubernetes.io/audit: restricted
+              pod-security.kubernetes.io/audit-version: latest
+              pod-security.kubernetes.io/warn: restricted
+              pod-security.kubernetes.io/warn-version: latest
+          EOF
+
+          # 3.5 k8s/01-security-configmap.yaml (Versión Correcta)
+          cat <<'EOF' > /home/ubuntu/s12/k8s/01-security-configmap.yaml
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: app-config
+            namespace: practica-s12
+          data:
+            DB_HOST: "mongo-service"
+            DB_PORT: "27017"
+            DB_NAME: "practica_s12"
+            APP_PORT: "3000"
+          EOF
+
+          # 3.6 k8s/02-db-secret.yaml
+          cat <<'EOF' > /home/ubuntu/s12/k8s/02-db-secret.yaml
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: db-secret
+            namespace: practica-s12
+          type: Opaque
+          data:
+            DB_USER: YXBwdXNlcg==
+            DB_PASS: QXZzYU1vbmdvU2VjdXJlMjAyNiE=
+          EOF
+
+          # 3.7 k8s/03-app-deployment.yaml (Versión Correcta)
+          cat <<'EOF' > /home/ubuntu/s12/k8s/03-app-deployment.yaml
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: mongo-pvc
+            namespace: practica-s12
+          spec:
+            accessModes:
+              - ReadWriteOnce
+            resources:
+              requests:
+                storage: 1Gi
+          ---
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: mongo
+            namespace: practica-s12
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: mongo
+            template:
+              metadata:
+                labels:
+                  app: mongo
+              spec:
+                securityContext:
+                  runAsNonRoot: true
+                  runAsUser: 10001
+                  runAsGroup: 10001
+                  fsGroup: 10001
+                  seccompProfile:
+                    type: RuntimeDefault
+                containers:
+                  - name: mongo
+                    image: mongo:7.0
+                    imagePullPolicy: IfNotPresent
+                    command: ["mongod", "--bind_ip_all", "--port", "27017", "--dbpath", "/data/db"]
+                    securityContext:
+                      readOnlyRootFilesystem: true
+                      allowPrivilegeEscalation: false
+                      capabilities:
+                        drop: ["ALL"]
+                    ports:
+                      - containerPort: 27017
+                    resources:
+                      requests:
+                        cpu: "100m"
+                        memory: "256Mi"
+                    livenessProbe:
+                      tcpSocket:
+                        port: 27017
+                      initialDelaySeconds: 15
+                      periodSeconds: 10
+                    readinessProbe:
+                      tcpSocket:
+                        port: 27017
+                      initialDelaySeconds: 5
+                      periodSeconds: 5
+                    volumeMounts:
+                      - name: mongo-data
+                        mountPath: /data/db
+                      - name: mongo-config
+                        mountPath: /data/configdb
+                      - name: tmp-dir
+                        mountPath: /tmp
+                      - name: run-dir
+                        mountPath: /var/run
+                volumes:
+                  - name: mongo-data
+                    persistentVolumeClaim:
+                      claimName: mongo-pvc
+                  - name: mongo-config
+                    emptyDir: {}
+                  - name: tmp-dir
+                    emptyDir: {}
+                  - name: run-dir
+                    emptyDir: {}
+          ---
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: app
+            namespace: practica-s12
+          spec:
+            replicas: 2
+            selector:
+              matchLabels:
+                app: app
+            template:
+              metadata:
+                labels:
+                  app: app
+              spec:
+                securityContext:
+                  runAsNonRoot: true
+                  runAsUser: 10001
+                  runAsGroup: 10001
+                  fsGroup: 10001
+                  seccompProfile:
+                    type: RuntimeDefault
+                containers:
+                  - name: app
+                    image: app-s12:1.0
+                    imagePullPolicy: IfNotPresent
+                    securityContext:
+                      readOnlyRootFilesystem: true
+                      allowPrivilegeEscalation: false
+                      capabilities:
+                        drop: ["ALL"]
+                    ports:
+                      - containerPort: 3000
+                    envFrom:
+                      - configMapRef:
+                          name: app-config
+                      - secretRef:
+                          name: db-secret
+                    resources:
+                      requests:
+                        cpu: "50m"
+                        memory: "128Mi"
+                    livenessProbe:
+                      httpGet:
+                        path: /health/live
+                        port: 3000
+                      initialDelaySeconds: 10
+                      periodSeconds: 10
+                    readinessProbe:
+                      httpGet:
+                        path: /health/ready
+                        port: 3000
+                      initialDelaySeconds: 5
+                      periodSeconds: 5
+                    volumeMounts:
+                      - name: tmp-dir
+                        mountPath: /tmp
+                      - name: appuser-home
+                        mountPath: /home/appuser
+                volumes:
+                  - name: tmp-dir
+                    emptyDir: {}
+                  - name: appuser-home
+                    emptyDir: {}
+          EOF
+
+          # 3.8 k8s/04-app-service.yaml (Versión Correcta)
+          cat <<'EOF' > /home/ubuntu/s12/k8s/04-app-service.yaml
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: mongo-service
+            namespace: practica-s12
+          spec:
+            type: ClusterIP
+            selector:
+              app: mongo
+            ports:
+              - name: mongodb
+                port: 27017
+                targetPort: 27017
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: app-service
+            namespace: practica-s12
+          spec:
+            type: NodePort
+            selector:
+              app: app
+            ports:
+              - name: http
+                port: 3000
+                targetPort: 3000
+                nodePort: 30080
+          EOF
+
+          # 3.9 ESCENARIOS CON FALLAS
+          # Falla A: DATABASE_NAME en vez de DB_NAME
+          cat <<'EOF' > /home/ubuntu/s12/escenarios/con-fallas/01-security-configmap.yaml
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: app-config
+            namespace: practica-s12
+          data:
+            DB_HOST: "mongo-service"
+            DB_PORT: "27017"
+            DATABASE_NAME: "practica_s12"
+            APP_PORT: "3000"
+          EOF
+
+          # Falla C: Sondas apuntando a /healthz y /ready
+          cat <<'EOF' > /home/ubuntu/s12/escenarios/con-fallas/03-app-deployment.yaml
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: mongo-pvc
+            namespace: practica-s12
+          spec:
+            accessModes:
+              - ReadWriteOnce
+            resources:
+              requests:
+                storage: 1Gi
+          ---
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: mongo
+            namespace: practica-s12
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: mongo
+            template:
+              metadata:
+                labels:
+                  app: mongo
+              spec:
+                securityContext:
+                  runAsNonRoot: true
+                  runAsUser: 10001
+                  runAsGroup: 10001
+                  fsGroup: 10001
+                  seccompProfile:
+                    type: RuntimeDefault
+                containers:
+                  - name: mongo
+                    image: mongo:7.0
+                    imagePullPolicy: IfNotPresent
+                    command: ["mongod", "--bind_ip_all", "--port", "27017", "--dbpath", "/data/db"]
+                    securityContext:
+                      readOnlyRootFilesystem: true
+                      allowPrivilegeEscalation: false
+                      capabilities:
+                        drop: ["ALL"]
+                    ports:
+                      - containerPort: 27017
+                    resources:
+                      requests:
+                        cpu: "100m"
+                        memory: "256Mi"
+                    livenessProbe:
+                      tcpSocket:
+                        port: 27017
+                      initialDelaySeconds: 15
+                      periodSeconds: 10
+                    readinessProbe:
+                      tcpSocket:
+                        port: 27017
+                      initialDelaySeconds: 5
+                      periodSeconds: 5
+                    volumeMounts:
+                      - name: mongo-data
+                        mountPath: /data/db
+                      - name: mongo-config
+                        mountPath: /data/configdb
+                      - name: tmp-dir
+                        mountPath: /tmp
+                      - name: run-dir
+                        mountPath: /var/run
+                volumes:
+                  - name: mongo-data
+                    persistentVolumeClaim:
+                      claimName: mongo-pvc
+                  - name: mongo-config
+                    emptyDir: {}
+                  - name: tmp-dir
+                    emptyDir: {}
+                  - name: run-dir
+                    emptyDir: {}
+          ---
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: app
+            namespace: practica-s12
+          spec:
+            replicas: 2
+            selector:
+              matchLabels:
+                app: app
+            template:
+              metadata:
+                labels:
+                  app: app
+              spec:
+                securityContext:
+                  runAsNonRoot: true
+                  runAsUser: 10001
+                  runAsGroup: 10001
+                  fsGroup: 10001
+                  seccompProfile:
+                    type: RuntimeDefault
+                containers:
+                  - name: app
+                    image: app-s12:1.0
+                    imagePullPolicy: IfNotPresent
+                    securityContext:
+                      readOnlyRootFilesystem: true
+                      allowPrivilegeEscalation: false
+                      capabilities:
+                        drop: ["ALL"]
+                    ports:
+                      - containerPort: 3000
+                    envFrom:
+                      - configMapRef:
+                          name: app-config
+                      - secretRef:
+                          name: db-secret
+                    resources:
+                      requests:
+                        cpu: "50m"
+                        memory: "128Mi"
+                    # [FALLA C] Rutas no existentes (404)
+                    livenessProbe:
+                      httpGet:
+                        path: /healthz
+                        port: 3000
+                      initialDelaySeconds: 10
+                      periodSeconds: 10
+                    readinessProbe:
+                      httpGet:
+                        path: /ready
+                        port: 3000
+                      initialDelaySeconds: 5
+                      periodSeconds: 5
+                    volumeMounts:
+                      - name: tmp-dir
+                        mountPath: /tmp
+                      - name: appuser-home
+                        mountPath: /home/appuser
+                volumes:
+                  - name: tmp-dir
+                    emptyDir: {}
+                  - name: appuser-home
+                    emptyDir: {}
+          EOF
+
+          # Falla B: mongo-service targetPort 27018
+          cat <<'EOF' > /home/ubuntu/s12/escenarios/con-fallas/04-app-service.yaml
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: mongo-service
+            namespace: practica-s12
+          spec:
+            type: ClusterIP
+            selector:
+              app: mongo
+            ports:
+              - name: mongodb
+                port: 27017
+                targetPort: 27018
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: app-service
+            namespace: practica-s12
+          spec:
+            type: NodePort
+            selector:
+              app: app
+            ports:
+              - name: http
+                port: 3000
+                targetPort: 3000
+                nodePort: 30080
+          EOF
+
+          # 4. Construcción e importación de la imagen en K3s
+          echo "[S12] Construyendo imagen Docker app-s12:1.0..."
+          cd /home/ubuntu/s12/src
+          docker build -t app-s12:1.0 .
+
+          echo "[S12] Importando imagen app-s12:1.0 al runtime de K3s (containerd)..."
+          docker save app-s12:1.0 | k3s ctr images import -
+
+          echo "[S12] Precargando imagen mongo:7.0..."
+          docker pull mongo:7.0
+          docker save mongo:7.0 | k3s ctr images import -
+
+          # 5. Aplicar manifiestos con el ESCENARIO CON FALLAS
+          echo "[S12] Desplegando manifiestos en Kubernetes (Escenario con Fallas)..."
+          kubectl apply -f /home/ubuntu/s12/k8s/00-namespace.yaml
+          kubectl apply -f /home/ubuntu/s12/k8s/02-db-secret.yaml
+          kubectl apply -f /home/ubuntu/s12/escenarios/con-fallas/01-security-configmap.yaml
+          kubectl apply -f /home/ubuntu/s12/escenarios/con-fallas/03-app-deployment.yaml
+          kubectl apply -f /home/ubuntu/s12/escenarios/con-fallas/04-app-service.yaml
+
+          # Asegurar permisos correctos en el directorio del proyecto
+          chown -R ubuntu:ubuntu /home/ubuntu/s12
+
+          echo "========================================================="
+          echo "[S12] S12 LISTO"
+          echo "========================================================="
+
+Outputs:
+  InstanceId:
+    Description: ID de la instancia EC2 K3s Master
+    Value: !Ref K3sEC2Instance
+
+  PublicIP:
+    Description: Dirección IPv4 pública de la instancia EC2
+    Value: !GetAtt K3sEC2Instance.PublicIp
+
+  SSHAccess:
+    Description: Comando para conectar por SSH al nodo K3s
+    Value: !Sub "ssh ubuntu@${K3sEC2Instance.PublicIp}"
+
+  AppURL:
+    Description: URL pública para acceder a la aplicación AVSA NodePort
+    Value: !Sub "http://${K3sEC2Instance.PublicIp}:30080"
+
+  CheckProvisionLog:
+    Description: Comando para verificar la bitácora de provisión automatizada
+    Value: !Sub "ssh ubuntu@${K3sEC2Instance.PublicIp} 'sudo cat /var/log/s12.log | grep -E \"\\[S12\\]\"'"

@@ -1,0 +1,190 @@
+# ==============================================================================
+# ESCENARIO CON FALLAS - 03-app-deployment.yaml
+# FALLA INYECTADA: Falla C (Sondas de Salud Erróneas)
+# DESCRIPCIÓN: Sondas de salud apuntando a rutas inexistentes (/healthz y /ready).
+# EFECTO: Express devuelve HTTP 404 en /healthz y /ready. Kubelet marca los pods
+#         como no preparados (0/1 Ready) y reinicia continuamente los contenedores
+#         por fallo en livenessProbe.
+# ==============================================================================
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mongo-pvc
+  namespace: practica-s12
+  labels:
+    app: mongo
+    app.kubernetes.io/name: mongo-storage
+    app.kubernetes.io/part-of: practica-s12
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mongo
+  namespace: practica-s12
+  labels:
+    app: mongo
+    app.kubernetes.io/name: mongo
+    app.kubernetes.io/part-of: practica-s12
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mongo
+  template:
+    metadata:
+      labels:
+        app: mongo
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: mongo
+          image: mongo:7.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - mongod
+            - "--bind_ip_all"
+            - "--port"
+            - "27017"
+            - "--dbpath"
+            - "/data/db"
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          ports:
+            - containerPort: 27017
+              name: mongodb
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          livenessProbe:
+            tcpSocket:
+              port: 27017
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            tcpSocket:
+              port: 27017
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          volumeMounts:
+            - name: mongo-data
+              mountPath: /data/db
+            - name: mongo-config
+              mountPath: /data/configdb
+            - name: tmp-dir
+              mountPath: /tmp
+            - name: run-dir
+              mountPath: /var/run
+      volumes:
+        - name: mongo-data
+          persistentVolumeClaim:
+            claimName: mongo-pvc
+        - name: mongo-config
+          emptyDir: {}
+        - name: tmp-dir
+          emptyDir: {}
+        - name: run-dir
+          emptyDir: {}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app
+  namespace: practica-s12
+  labels:
+    app: app
+    app.kubernetes.io/name: avsa-app
+    app.kubernetes.io/part-of: practica-s12
+    escenario: con-fallas
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: app
+  template:
+    metadata:
+      labels:
+        app: app
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: app
+          image: app-s12:1.0
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          ports:
+            - containerPort: 3000
+              name: http
+          envFrom:
+            - configMapRef:
+                name: app-config
+            - secretRef:
+                name: db-secret
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "128Mi"
+            limits:
+              cpu: "250m"
+              memory: "256Mi"
+          # [FALLA C] Sondas apuntando a rutas inexistentes (/healthz y /ready devuelven HTTP 404)
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 3000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 3000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          volumeMounts:
+            - name: tmp-dir
+              mountPath: /tmp
+            - name: appuser-home
+              mountPath: /home/appuser
+      volumes:
+        - name: tmp-dir
+          emptyDir: {}
+        - name: appuser-home
+          emptyDir: {}

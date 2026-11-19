@@ -1,0 +1,22 @@
+# ==============================================================================
+# ESCENARIO CON FALLAS - 01-security-configmap.yaml
+# FALLA INYECTADA: Falla A (Configuración)
+# DESCRIPCIÓN: Se define la clave 'DATABASE_NAME' en lugar de 'DB_NAME'.
+# EFECTO: La aplicación Node.js busca process.env.DB_NAME, al no encontrarla
+#         ejecuta una salida con error fatal (exit code 1), causando CrashLoopBackOff.
+# ==============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  namespace: practica-s12
+  labels:
+    app.kubernetes.io/name: avsa-app
+    app.kubernetes.io/part-of: practica-s12
+    escenario: con-fallas
+data:
+  DB_HOST: "mongo-service"
+  DB_PORT: "27017"
+  # [FALLA A] Discrepancia de clave: debería ser DB_NAME
+  DATABASE_NAME: "practica_s12"
+  APP_PORT: "3000"
